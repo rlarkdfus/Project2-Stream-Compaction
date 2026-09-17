@@ -12,37 +12,35 @@ namespace StreamCompaction {
             return timer;
         }
 
-        #define blockSize 128
-
-        __global__ void kernUpSweep(int n, int stride, int *data) {
+        __global__ void kernUpSweepOptimized(int n, int stride, int *data) {
             int k = threadIdx.x + (blockIdx.x * blockDim.x);
-            int idx = (k + 1) * stride - 1;
-            if (idx >= n) {
+            if (k >= n) {
                 return;
             }
+            int idx = (k + 1) * stride - 1;
             data[idx] += data[idx - (stride >> 1)];
         }
 
-        __global__ void kernDownSweep(int n, int stride, int *data) {
+        __global__ void kernDownSweepOptimized(int n, int stride, int *data) {
             int k = threadIdx.x + (blockIdx.x * blockDim.x);
-            int idx = (k + 1) * stride - 1;
-            if (idx >= n) {
+            if (k >= n) {
                 return;
             }
+            int idx = (k + 1) * stride - 1;
             int left = idx - (stride >> 1);
             int t = data[left];
             data[left] = data[idx];
             data[idx] += t;
         }
 
-        static void scanOnDevice(int n, int *dev_data) {
+        static void scanOnDeviceOptimized(int n, int *dev_data, int blockSize) {
             int levels = ilog2(n);
 
             for (int d = 0; d < levels; d++) {
                 int stride = 1 << (d + 1);
                 int numActive = n / stride;
                 dim3 fullBlocksPerGrid((numActive + blockSize - 1) / blockSize);
-                kernUpSweep<<<fullBlocksPerGrid, blockSize>>>(n, stride, dev_data);
+                kernUpSweepOptimized<<<fullBlocksPerGrid, blockSize>>>(numActive, stride, dev_data);
             }
 
             cudaMemset(dev_data + (n - 1), 0, sizeof(int));
@@ -51,6 +49,46 @@ namespace StreamCompaction {
                 int stride = 1 << (d + 1);
                 int numActive = n / stride;
                 dim3 fullBlocksPerGrid((numActive + blockSize - 1) / blockSize);
+                kernDownSweepOptimized<<<fullBlocksPerGrid, blockSize>>>(numActive, stride, dev_data);
+            }
+        }
+
+        __global__ void kernUpSweep(int n, int stride, int *data) {
+            int k = threadIdx.x + (blockIdx.x * blockDim.x);
+            if (k >= n) {
+                return;
+            }
+            if ((k + 1) % stride == 0) {
+                data[k] += data[k - (stride >> 1)];
+            }
+        }
+
+        __global__ void kernDownSweep(int n, int stride, int *data) {
+            int k = threadIdx.x + (blockIdx.x * blockDim.x);
+            if (k >= n) {
+                return;
+            }
+            if ((k + 1) % stride == 0) {
+                int left = k - (stride >> 1);
+                int t = data[left];
+                data[left] = data[k];
+                data[k] += t;
+            }
+        }
+
+        static void scanOnDevice(int n, int *dev_data, int blockSize) {
+            int levels = ilog2(n);
+            dim3 fullBlocksPerGrid((n + blockSize - 1) / blockSize);
+
+            for (int d = 0; d < levels; d++) {
+                int stride = 1 << (d + 1);
+                kernUpSweep<<<fullBlocksPerGrid, blockSize>>>(n, stride, dev_data);
+            }
+
+            cudaMemset(dev_data + (n - 1), 0, sizeof(int));
+
+            for (int d = levels - 1; d >= 0; d--) {
+                int stride = 1 << (d + 1);
                 kernDownSweep<<<fullBlocksPerGrid, blockSize>>>(n, stride, dev_data);
             }
         }
@@ -58,7 +96,7 @@ namespace StreamCompaction {
         /**
          * Performs prefix-sum (aka scan) on idata, storing the result into odata.
          */
-        void scan(int n, int *odata, const int *idata) {
+        void scan(int n, int *odata, const int *idata, int blockSize) {
             int paddedN = 1 << ilog2ceil(n);
 
             int *dev_data;
@@ -71,7 +109,8 @@ namespace StreamCompaction {
 
             timer().startGpuTimer();
 
-            scanOnDevice(paddedN, dev_data);
+            scanOnDeviceOptimized(paddedN, dev_data, blockSize);
+            // scanOnDevice(paddedN, dev_data, blockSize);
 
             timer().endGpuTimer();
 
@@ -91,6 +130,7 @@ namespace StreamCompaction {
          * @returns      The number of elements remaining after compaction.
          */
         int compact(int n, int *odata, const int *idata) {
+            const int blockSize = 128;
             int paddedN = 1 << ilog2ceil(n);
 
             int *dev_idata, *dev_odata, *dev_bools, *dev_scan;
@@ -113,7 +153,7 @@ namespace StreamCompaction {
 
             StreamCompaction::Common::kernMapToBoolean<<<fullBlocksPerGrid, blockSize>>>(n, dev_bools, dev_idata);
             cudaMemcpy(dev_scan, dev_bools, n * sizeof(int), cudaMemcpyDeviceToDevice);
-            scanOnDevice(paddedN, dev_scan);
+            scanOnDeviceOptimized(paddedN, dev_scan, blockSize);
             StreamCompaction::Common::kernScatter<<<fullBlocksPerGrid, blockSize>>>(n, dev_odata, dev_idata, dev_bools, dev_scan);
 
             timer().endGpuTimer();

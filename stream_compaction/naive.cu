@@ -11,8 +11,6 @@ namespace StreamCompaction {
             static PerformanceTimer timer;
             return timer;
         }
-        #define blockSize 128
-
         __global__ void kernNaiveScanStep(int n, int offset, int *odata, const int *idata) {
             int k = threadIdx.x + (blockIdx.x * blockDim.x);
             if (k >= n) {
@@ -32,7 +30,7 @@ namespace StreamCompaction {
         /**
          * Performs prefix-sum (aka scan) on idata, storing the result into odata.
          */
-        void scan(int n, int *odata, const int *idata) {
+        void scan(int n, int *odata, const int *idata, int blockSize) {
             int *dev_A, *dev_B;
             cudaMalloc((void**)&dev_A, n * sizeof(int));
             checkCUDAError("cudaMalloc dev_A failed!");
